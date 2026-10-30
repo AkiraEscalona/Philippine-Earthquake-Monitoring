@@ -1,376 +1,156 @@
-"""
-Kafka Producer Template for Streaming Data Dashboard
-STUDENT PROJECT: Big Data Streaming Data Producer
+"""GarbinWx -> Kafka producer.
 
-This is a template for students to build a Kafka producer that generates and sends
-streaming data to Kafka for consumption by the dashboard.
+Polls the GarbinWx earthquake feed at a conservative interval (default 5 min, never below
+60 s), validates and normalizes records, publishes only new/revised earthquakes to Kafka,
+and sends one heartbeat message per poll so the dashboard can show data freshness.
 
-DO NOT MODIFY THE TEMPLATE STRUCTURE - IMPLEMENT THE TODO SECTIONS
+Usage (PowerShell):
+    python producer.py              # run forever
+    python producer.py --once       # one poll, then exit
+    python producer.py --dry-run    # fetch + validate, print a summary, do NOT touch Kafka
 """
+from __future__ import annotations
 
 import argparse
 import json
-import time
-import random
-import math
-from datetime import datetime, timedelta
-from typing import Dict, Any, List
+import logging
+import signal
+import sys
+import threading
+from datetime import datetime, timezone
 
-# Kafka libraries
-from kafka import KafkaProducer
-from kafka.errors import KafkaError, NoBrokersAvailable
+from eqmon.api_client import FetchError, GarbinWxClient, compute_backoff
+from eqmon.config import Settings, load_settings
+from eqmon.dedupe import Deduper
+from eqmon.kafka_io import Publisher
+from eqmon.normalize import FeedFormatError, iso_utc, normalize_feed
+
+log = logging.getLogger("producer")
 
 
-class StreamingDataProducer:
-    """
-    Enhanced Kafka producer with stateful synthetic data generation
-    This class handles Kafka connection, realistic data generation, and message sending
-    """
-    
-    def __init__(self, bootstrap_servers: str, topic: str):
-        """
-        Initialize Kafka producer configuration with stateful data generation
-        
-        Parameters:
-        - bootstrap_servers: Kafka broker addresses (e.g., "localhost:9092")
-        - topic: Kafka topic to produce messages to
-        """
-        self.bootstrap_servers = bootstrap_servers
-        self.topic = topic
-        
-        # Kafka producer configuration
-        self.producer_config = {
-            'bootstrap_servers': bootstrap_servers,
-            # 'security_protocol': 'SSL',  # If using SSL
-            # 'ssl_cafile': 'path/to/ca.pem',  # If using SSL
-            # 'ssl_certfile': 'path/to/service.cert',  # If using SSL
-            # 'ssl_keyfile': 'path/to/service.key',  # If using SSL
-            # 'compression_type': 'gzip',  # Optional: Enable compression
-            # 'batch_size': 16384,  # Optional: Tune batch size
-            # 'linger_ms': 10,  # Optional: Wait for batch fill
-        }
-        
-        # Stateful data generation attributes
-        self.sensor_states = {}  # Track state for each sensor
-        self.time_counter = 0    # Track time progression
-        self.base_time = datetime.utcnow()
-        
-        # Expanded sensor pool with metadata
-        self.sensors = [
-            {"id": "sensor_001", "location": "server_room_a", "type": "temperature", "unit": "celsius"},
-            {"id": "sensor_002", "location": "server_room_b", "type": "temperature", "unit": "celsius"},
-            {"id": "sensor_003", "location": "outdoor_north", "type": "temperature", "unit": "celsius"},
-            {"id": "sensor_004", "location": "lab_1", "type": "humidity", "unit": "percent"},
-            {"id": "sensor_005", "location": "lab_2", "type": "humidity", "unit": "percent"},
-            {"id": "sensor_006", "location": "control_room", "type": "pressure", "unit": "hPa"},
-            {"id": "sensor_007", "location": "factory_floor", "type": "pressure", "unit": "hPa"},
-            {"id": "sensor_008", "location": "warehouse", "type": "temperature", "unit": "celsius"},
-            {"id": "sensor_009", "location": "office_area", "type": "humidity", "unit": "percent"},
-            {"id": "sensor_010", "location": "basement", "type": "pressure", "unit": "hPa"},
-        ]
-        
-        # Metric type configurations
-        self.metric_ranges = {
-            "temperature": {"min": -10, "max": 45, "daily_amplitude": 8, "trend_range": (-0.5, 0.5)},
-            "humidity": {"min": 20, "max": 95, "daily_amplitude": 15, "trend_range": (-0.2, 0.2)},
-            "pressure": {"min": 980, "max": 1040, "daily_amplitude": 5, "trend_range": (-0.1, 0.1)},
-        }
-        
-        # Initialize Kafka producer
+def build_heartbeat(
+    fetched_at: datetime, source_last_updated: str | None, feed_total: int, valid: int,
+    rejected: int, published: int, poll_interval_s: int,
+) -> dict:
+    return {
+        "kind": "heartbeat",
+        "fetched_at": iso_utc(fetched_at),
+        "source_last_updated": source_last_updated,
+        "feed_total": feed_total,
+        "valid": valid,
+        "rejected": rejected,
+        "published": published,
+        "poll_interval_s": poll_interval_s,
+    }
+
+
+def poll_once(
+    client: GarbinWxClient, publisher: Publisher | None, deduper: Deduper, settings: Settings,
+    last_source_updated: str | None = None,
+) -> dict:
+    """One fetch -> normalize -> dedupe -> publish cycle. Raises FetchError / FeedFormatError."""
+    fetched_at = datetime.now(timezone.utc)
+    result = client.fetch()
+
+    if result.status == 304:  # unchanged upstream
+        summary = {"status": 304, "feed_total": 0, "valid": 0, "rejected": 0, "published": 0, "duplicates": 0,
+                   "source_last_updated": last_source_updated, "max_age": result.max_age}
+        if publisher:
+            publisher.publish([("heartbeat", build_heartbeat(fetched_at, last_source_updated, 0, 0, 0, 0, settings.poll_interval_s))])
+        return summary
+
+    feed = normalize_feed(result.payload, fetched_at=fetched_at)
+    if feed.declared_total is not None and feed.declared_total != feed.feed_total:
+        log.warning("metadata.total_earthquakes=%s but feed contains %s records", feed.declared_total, feed.feed_total)
+    if feed.rejected:
+        log.warning("Rejected %d records: %s", len(feed.rejected), feed.rejection_summary())
+    if not feed.events:
+        log.warning("Feed contained no valid earthquakes")
+
+    fresh, duplicates = deduper.filter_new(feed.events)
+    failed: set[str] = set()
+    if publisher:
+        messages = [(e["event_id"], e) for e in fresh]
+        failed = publisher.publish(messages) if messages else set()
+        published_events = [e for e in fresh if e["event_id"] not in failed]
+        deduper.commit(published_events)  # only remember what Kafka acknowledged
+        deduper.save()
+        publisher.publish([("heartbeat", build_heartbeat(
+            fetched_at, feed.source_last_updated, feed.feed_total, len(feed.events),
+            len(feed.rejected), len(published_events), settings.poll_interval_s))])
+        if failed:
+            raise ConnectionError(f"{len(failed)} messages were not delivered to Kafka; they will be retried")
+    return {
+        "status": 200, "feed_total": feed.feed_total, "valid": len(feed.events), "rejected": len(feed.rejected),
+        "published": len(fresh) - len(failed), "duplicates": duplicates,
+        "source_last_updated": feed.source_last_updated, "max_age": result.max_age,
+    }
+
+
+def run(settings: Settings, publisher: Publisher | None, stop: threading.Event, once: bool = False) -> int:
+    client = GarbinWxClient(settings.api_url, settings.user_agent, settings.request_timeout_s)
+    deduper = Deduper(settings.state_path)
+    failures = 0
+    last_source_updated: str | None = None
+    exit_code = 0
+    log.info("Source: %s | poll every %ss | topic=%s", settings.api_url, settings.poll_interval_s, settings.kafka_topic)
+
+    while not stop.is_set():
+        wait = settings.poll_interval_s
         try:
-            self.producer = KafkaProducer(**self.producer_config)
-            print(f"Kafka producer initialized for {bootstrap_servers} on topic {topic}")
-        except NoBrokersAvailable:
-            print(f"ERROR: No Kafka brokers available at {bootstrap_servers}")
-            self.producer = None
-        except Exception as e:
-            print(f"ERROR: Failed to initialize Kafka producer: {e}")
-            self.producer = None
+            summary = poll_once(client, publisher, deduper, settings, last_source_updated)
+            last_source_updated = summary["source_last_updated"] or last_source_updated
+            failures = 0
+            log.info("Poll OK: %s", json.dumps(summary))
+            if summary.get("max_age"):  # honour the server's own cache guidance if it is longer
+                wait = max(wait, summary["max_age"])
+        except (FetchError, FeedFormatError, ConnectionError) as exc:
+            failures += 1
+            exit_code = 1
+            wait = compute_backoff(failures, cap=settings.max_backoff_s)
+            if isinstance(exc, FetchError) and exc.retry_after:
+                wait = max(wait, exc.retry_after)
+            log.error("Poll failed (%d in a row): %s - retrying in %.0fs", failures, exc, wait)
+        else:
+            exit_code = 0
+        if once:
+            break
+        stop.wait(wait)  # interruptible sleep -> prompt Ctrl+C shutdown
 
-    def generate_sample_data(self) -> Dict[str, Any]:
-        """
-        Generate realistic streaming data with stateful patterns
-        
-        This function creates continuously changing records with realistic patterns:
-        - Daily cycles using sine waves
-        - Gradual trends and realistic noise
-        - Multiple metric types (temperature, humidity, pressure)
-        - Temporal consistency with progressive timestamps
-        
-        Expected data format (must include these fields for dashboard compatibility):
-        {
-            "timestamp": "2023-10-01T12:00:00Z",  # ISO format timestamp
-            "value": 123.45,                      # Numeric measurement value
-            "metric_type": "temperature",         # Type of metric (temperature, humidity, etc.)
-            "sensor_id": "sensor_001",            # Unique identifier for data source
-            "location": "server_room_a",          # Sensor location
-            "unit": "celsius",                    # Measurement unit
-        }
-        """
-        
-        # Select a random sensor from the expanded pool
-        sensor = random.choice(self.sensors)
-        sensor_id = sensor["id"]
-        metric_type = sensor["type"]
-        
-        # Initialize sensor state if not exists
-        if sensor_id not in self.sensor_states:
-            config = self.metric_ranges[metric_type]
-            base_value = random.uniform(config["min"], config["max"])
-            trend = random.uniform(config["trend_range"][0], config["trend_range"][1])
-            phase_offset = random.uniform(0, 2 * 3.14159)  # Random phase for daily cycle
-            
-            self.sensor_states[sensor_id] = {
-                "base_value": base_value,
-                "trend": trend,
-                "phase_offset": phase_offset,
-                "last_value": base_value,
-                "message_count": 0
-            }
-        
-        state = self.sensor_states[sensor_id]
-        
-        # Calculate progressive timestamp with configurable intervals
-        current_time = self.base_time + timedelta(seconds=self.time_counter)
-        self.time_counter += random.uniform(0.5, 2.0)  # Variable intervals for realism
-        
-        # Generate realistic value with patterns
-        config = self.metric_ranges[metric_type]
-        
-        # Daily cycle using sine wave (24-hour period)
-        hours_in_day = 24
-        current_hour = current_time.hour + current_time.minute / 60
-        daily_cycle = math.sin(2 * 3.14159 * current_hour / hours_in_day + state["phase_offset"])
-        
-        # Apply trend over time (slow drift)
-        trend_effect = state["trend"] * (state["message_count"] / 100.0)
-        
-        # Add realistic noise (small random variations)
-        noise = random.uniform(-config["daily_amplitude"] * 0.1, config["daily_amplitude"] * 0.1)
-        
-        # Calculate final value with bounds checking
-        base_value = state["base_value"]
-        daily_variation = daily_cycle * config["daily_amplitude"]
-        raw_value = base_value + daily_variation + trend_effect + noise
-        
-        # Ensure value stays within reasonable bounds
-        bounded_value = max(config["min"], min(config["max"], raw_value))
-        
-        # Update state
-        state["last_value"] = bounded_value
-        state["message_count"] += 1
-        
-        # Occasionally introduce small trend changes for realism
-        if random.random() < 0.01:  # 1% chance per message
-            state["trend"] = random.uniform(config["trend_range"][0], config["trend_range"][1])
-        
-        # Generate realistic data structure
-        sample_data = {
-            "timestamp": current_time.isoformat() + 'Z',
-            "value": round(bounded_value, 2),
-            "metric_type": metric_type,
-            "sensor_id": sensor_id,
-            "location": sensor["location"],
-            "unit": sensor["unit"],
-        }
-        
-        return sample_data
+    if publisher:
+        publisher.close()
+    log.info("Producer stopped.")
+    return exit_code
 
-    def serialize_data(self, data: Dict[str, Any]) -> bytes:
-        """
-        STUDENT TODO: Implement data serialization
-        
-        Convert the data dictionary to bytes for Kafka transmission.
-        Common formats: JSON, Avro, Protocol Buffers
-        
-        For simplicity, we use JSON serialization in this template.
-        Consider using Avro for better schema evolution in production.
-        """
-        
-        # STUDENT TODO: Choose and implement your serialization method
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--once", action="store_true", help="poll one time and exit")
+    parser.add_argument("--dry-run", action="store_true", help="fetch and validate only; no Kafka")
+    parser.add_argument("--log-level", default="INFO")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+
+    settings = load_settings()
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: (log.info("Shutdown requested..."), stop.set()))
+
+    publisher: Publisher | None = None
+    if not args.dry_run:
+        from eqmon.kafka_io import KafkaPublisher
+
         try:
-            # JSON serialization (simple but less efficient)
-            serialized_data = json.dumps(data).encode('utf-8')
-            
-            # STUDENT TODO: Consider using Avro for better performance and schema management
-            # from avro import schema, datafile, io
-            # serialized_data = avro_serializer.serialize(data)
-            
-            return serialized_data
-        except Exception as e:
-            print(f"STUDENT TODO: Implement proper error handling for serialization: {e}")
-            return None
-
-    def send_message(self, data: Dict[str, Any]) -> bool:
-        """
-        Implement message sending to Kafka
-        
-        Parameters:
-        - data: Dictionary containing the message data
-        
-        Returns:
-        - bool: True if message was sent successfully, False otherwise
-        """
-        
-        # Check if producer is initialized
-        if not self.producer:
-            print("ERROR: Kafka producer not initialized")
-            return False
-        
-        # Serialize the data
-        serialized_data = self.serialize_data(data)
-        if not serialized_data:
-            print("ERROR: Serialization failed")
-            return False
-        
-        try:
-            # Send message to Kafka
-            future = self.producer.send(self.topic, value=serialized_data)
-            # Wait for send confirmation with timeout
-            result = future.get(timeout=10)
-            print(f"Message sent successfully - Topic: {self.topic}, Data: {data}")
-            return True
-            
-        except KafkaError as e:
-            print(f"Kafka send error: {e}")
-            return False
-        except Exception as e:
-            print(f"Unexpected error during send: {e}")
-            return False
-
-    def produce_stream(self, messages_per_second: float = 0.1, duration: int = None):
-        """
-        STUDENT TODO: Implement the main streaming loop
-        
-        Parameters:
-        - messages_per_second: Rate of message production (default: 0.1 for 10-second intervals)
-        - duration: Total runtime in seconds (None for infinite)
-        """
-        
-        print(f"Starting producer: {messages_per_second} msg/sec ({1/messages_per_second:.1f} second intervals), duration: {duration or 'infinite'}")
-        
-        start_time = time.time()
-        message_count = 0
-        
-        try:
-            while True:
-                # Check if we've reached the duration limit
-                if duration and (time.time() - start_time) >= duration:
-                    print(f"Reached duration limit of {duration} seconds")
-                    break
-                
-                # Generate and send data
-                data = self.generate_sample_data()
-                success = self.send_message(data)
-                
-                if success:
-                    message_count += 1
-                    if message_count % 10 == 0:  # Print progress every 10 messages
-                        print(f"Sent {message_count} messages...")
-                
-                # Calculate sleep time to maintain desired message rate
-                sleep_time = 1.0 / messages_per_second
-                time.sleep(sleep_time)
-                
-        except KeyboardInterrupt:
-            print("\nProducer interrupted by user")
-        except Exception as e:
-            print(f"Streaming error: {e}")
-        finally:
-            # Implement proper cleanup
-            self.close()
-            print(f"Producer stopped. Total messages sent: {message_count}")
-
-    def close(self):
-        """Implement producer cleanup and resource release"""
-        if self.producer:
-            try:
-                # Ensure all messages are sent
-                self.producer.flush(timeout=10)
-                # Close producer connection
-                self.producer.close()
-                print("Kafka producer closed successfully")
-            except Exception as e:
-                print(f"Error closing Kafka producer: {e}")
+            publisher = KafkaPublisher(settings.kafka_bootstrap, settings.kafka_topic)
+            publisher.wait_until_ready()
+        except ImportError:
+            log.error("confluent-kafka is not installed. Run: pip install -r requirements.txt")
+            return 2
+        except ConnectionError as exc:
+            log.error("%s. Is Docker running? Try: docker compose up -d", exc)
+            return 2
+    return run(settings, publisher, stop, once=args.once or args.dry_run)
 
 
-def parse_arguments():
-    """STUDENT TODO: Configure command-line arguments for flexibility"""
-    parser = argparse.ArgumentParser(description='Kafka Streaming Data Producer')
-    
-    # STUDENT TODO: Add additional command-line arguments as needed
-    parser.add_argument(
-        '--bootstrap-servers',
-        type=str,
-        default='localhost:9092',
-        help='Kafka bootstrap servers (default: localhost:9092)'
-    )
-    
-    parser.add_argument(
-        '--topic',
-        type=str,
-        default='streaming-data',
-        help='Kafka topic to produce to (default: streaming-data)'
-    )
-    
-    parser.add_argument(
-        '--rate',
-        type=float,
-        default=0.1,
-        help='Messages per second (default: 0.1 for 10-second intervals)'
-    )
-    
-    parser.add_argument(
-        '--duration',
-        type=int,
-        default=None,
-        help='Run duration in seconds (default: infinite)'
-    )
-    
-    # STUDENT TODO: Add more arguments for your specific use case
-    # parser.add_argument('--sensor-count', type=int, default=5, help='Number of simulated sensors')
-    # parser.add_argument('--data-type', choices=['temperature', 'humidity', 'financial'], default='temperature')
-    
-    return parser.parse_args()
-
-
-def main():
-    """
-    STUDENT TODO: Customize the main execution flow as needed
-    
-    Implementation Steps:
-    1. Parse command-line arguments
-    2. Initialize Kafka producer
-    3. Start streaming data
-    4. Handle graceful shutdown
-    """
-    
-    print("=" * 60)
-    print("STREAMING DATA PRODUCER TEMPLATE")
-    print("STUDENT TODO: Implement all sections marked with 'STUDENT TODO'")
-    print("=" * 60)
-    
-    # Parse command-line arguments
-    args = parse_arguments()
-    
-    # Initialize producer
-    producer = StreamingDataProducer(
-        bootstrap_servers=args.bootstrap_servers,
-        topic=args.topic
-    )
-    
-    # Start producing stream
-    try:
-        producer.produce_stream(
-            messages_per_second=args.rate,
-            duration=args.duration
-        )
-    except Exception as e:
-        print(f"STUDENT TODO: Handle main execution errors: {e}")
-    finally:
-        print("Producer execution completed")
-
-
-# STUDENT TODO: Testing Instructions
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
